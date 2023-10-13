@@ -2,4 +2,4 @@ google-config.json
 smartmeter.json
 *.csv
 venv
-**/__py_cache/**
+**/__pycache__/**
