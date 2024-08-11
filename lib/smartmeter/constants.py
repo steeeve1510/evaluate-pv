@@ -5,8 +5,8 @@ import re
 import enum
 
 MAIN_SCRIPT_REGEX = re.compile(r"^main\S+\.js$")
-API_GATEWAY_TOKEN_REGEX = re.compile(r'b2cApiKey\:\s*\"([A-Za-z0-9\-_]+)\"', re.IGNORECASE)
-API_GATEWAY_B2B_TOKEN_REGEX = re.compile(r'b2bApiKey\:\s*\"([A-Za-z0-9\-_]+)\"', re.IGNORECASE)
+API_GATEWAY_TOKEN_REGEX = re.compile(r'\"b2cApiKey\"\:\s*\"([A-Za-z0-9\-_]+)\"', re.IGNORECASE)
+API_GATEWAY_B2B_TOKEN_REGEX = re.compile(r'\"b2bApiKey\"\:\s*\"([A-Za-z0-9\-_]+)\"', re.IGNORECASE)
 
 PAGE_URL = "https://smartmeter-web.wienernetze.at/"
 API_URL_ALT = "https://service.wienernetze.at/sm/api/"

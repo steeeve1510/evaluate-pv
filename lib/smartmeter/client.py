@@ -166,6 +166,7 @@ class Smartmeter:
         # sort the scripts in some order to find the keys faster
         # so far, the script was called main.XXXX.js
         scripts = sorted(scripts, key=lambda x: "main" not in x)
+        scripts.append('assets/app-config.json')
 
         for script in scripts:
             if key_b2c is not None and key_b2b is not None:

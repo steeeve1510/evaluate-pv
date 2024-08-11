@@ -69,7 +69,7 @@ def draw_weekend_background(df):
     if (len(df.index) <= 0):
         return
     timespan = max(df.index) - min(df.index)
-    if timespan < timedelta(days=6) or timespan > timedelta(days=25):
+    if timespan < timedelta(days=6) or timespan > timedelta(days=90):
         return
     
     dates = np.unique(df.index.date)
