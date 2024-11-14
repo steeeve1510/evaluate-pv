@@ -4,3 +4,4 @@ current.json
 *.csv
 venv
 **/__pycache__/**
+other
