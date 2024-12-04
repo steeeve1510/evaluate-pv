@@ -60,6 +60,17 @@ class Smartmeter:
         try:
             result = self.session.post(
                 url,
+                 data={
+                    "username": self.username,
+                    "login": ""
+                },
+                allow_redirects=False,
+            )
+            tree = html.fromstring(result.content)
+            action = tree.xpath("(//form/@action)")[0]
+
+            result = self.session.post(
+                action,
                 data={
                     "username": self.username,
                     "password": self.password,
