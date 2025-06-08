@@ -1,17 +1,17 @@
 """Contains the Smartmeter API Client."""
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime
 from urllib import parse
 
 import requests
 from lxml import html
 
-from . import constants as const
-from .errors import (
-    SmartmeterConnectionError,
-    SmartmeterLoginError,
-    SmartmeterQueryError,
-)
+from .errors import SmartmeterLoginError
+
+import base64
+import hashlib
+import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -19,186 +19,138 @@ logger = logging.getLogger(__name__)
 class Smartmeter:
     """Smartmeter client."""
 
-    def __init__(self, username, password):
+    API_URL_WSTW = "https://api.wstw.at/gateway/WN_SMART_METER_PORTAL_API_B2C/1.0/"
+    API_URL_WSTW_B2B = "https://api.wstw.at/gateway/WN_SMART_METER_PORTAL_API_B2B/1.0/"
+    API_URL_WN = "https://service.wienernetze.at/sm/api/"
+    API_DATE_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
+    AUTH_URL = "https://log.wien/auth/realms/logwien/protocol/openid-connect/"  # noqa
+    ORIGIN = "https://smartmeter-web.wienernetze.at"
+    REFERER = "https://smartmeter-web.wienernetze.at/"
+#    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.2903.70" #optional
+
+    def __init__(self, username, password, login=True, input_code_verifier=None):
         """Access the Smartmeter API.
 
         Args:
             username (str): Username used for API Login.
-            password (str): Username used for API Login.
+            password (str): Password used for API Login.
+            login (bool, optional): If _login() should be called. Defaults to True.
+            input_code_verifier (str): An optional fixed code_verifier for creating a code_challenge
         """
         self.username = username
         self.password = password
         self.session = requests.Session()
         self._access_token = None
-        self._refresh_token = None
-        self._api_gateway_token = None
-        self._access_token_expiration = None
-        self._refresh_token_expiration = None
-        self._api_gateway_b2b_token = None
 
-    def load_login_page(self):
+        self._code_verifier = None
+        if input_code_verifier is not None:
+            if self.is_valid_code_verifier(input_code_verifier):
+                self._code_verifier = input_code_verifier
+
+        self._code_challenge = None
+        self.session.headers.update({
+#           "User-Agent": self.USER_AGENT, #optional
+           "Referer": self.REFERER,
+           "Origin": self.ORIGIN,
+        })
+
+        if login:
+            self._login()
+
+    def generate_code_verifier(self):
         """
-        loads login page and extracts encoded login url
+        generate a code verifier
         """
-        login_url = const.AUTH_URL + "auth?" + parse.urlencode(const.LOGIN_ARGS)
-        try:
-            result = self.session.get(login_url)
-        except Exception as exception:
-            raise SmartmeterConnectionError("Could not load login page") from exception
-        if result.status_code != 200:
-            raise SmartmeterConnectionError(
-                f"Could not load login page. Error: {result.content}"
-            )
+        return base64.urlsafe_b64encode(os.urandom(32)).decode('utf-8').rstrip('=')
+
+    def generate_code_challenge(self, code_verifier):
+        """
+        generate a code challenge from the code verifier
+        """
+        code_challenge = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+        return base64.urlsafe_b64encode(code_challenge).decode('utf-8').rstrip('=')
+
+    def is_valid_code_verifier(self, code_verifier):
+        """
+        validate input
+        """
+        if not (43 <= len(code_verifier) <= 128):
+            return False
+
+        pattern = r'^[A-Za-z0-9\-._~]+$'
+        if not re.match(pattern, code_verifier):
+            return False
+
+        return True
+
+    def _login(self):
+        if not hasattr(self, '_code_verifier') or self._code_verifier is None:
+           #only generate code_verifier if it does not exist
+           self._code_verifier = self.generate_code_verifier()
+
+        #generate a code challenge from the code_verifier to enhance security
+        self._code_challenge = self.generate_code_challenge(self._code_verifier)
+
+        args = {
+            "client_id": "wn-smartmeter",
+            "redirect_uri": self.REFERER,
+            "response_mode": "fragment",
+            "response_type": "code",
+            "scope": "openid",
+            "nonce": "",
+            "prompt": "login",
+            "code_challenge": self._code_challenge,
+            "code_challenge_method": "S256"
+        }
+        login_url = self.AUTH_URL + "auth?" + parse.urlencode(args)
+        result = self.session.get(login_url)
+        tree = html.fromstring(result.content)
+
+        forms = tree.xpath("(//form/@action)")
+        action = forms[0]
+
+        result = self.session.post(
+           action,
+           data={
+              "username": self.username,
+              "login": ""
+           },
+           allow_redirects=False,
+        )
         tree = html.fromstring(result.content)
         action = tree.xpath("(//form/@action)")[0]
-        return action
 
-    def credentials_login(self, url):
-        """
-        login with credentials provided the login url
-        """
-        try:
-            result = self.session.post(
-                url,
-                 data={
-                    "username": self.username,
-                    "login": ""
-                },
-                allow_redirects=False,
-            )
-            tree = html.fromstring(result.content)
-            action = tree.xpath("(//form/@action)")[0]
-
-            result = self.session.post(
-                action,
-                data={
-                    "username": self.username,
-                    "password": self.password,
-                },
-                allow_redirects=False,
-            )
-        except Exception as exception:
-            raise SmartmeterConnectionError(
-                "Could not login with credentials"
-            ) from exception
+        result = self.session.post(
+            action,
+            data={
+                "username": self.username,
+                "password": self.password
+            },
+            allow_redirects=False,
+        )
 
         if "Location" not in result.headers:
             raise SmartmeterLoginError("Login failed. Check username/password.")
-        location = result.headers["Location"]
 
-        parsed_url = parse.urlparse(location)
+        code = result.headers["Location"].split("&code=", 1)[1]
 
-        fragment_dict = dict(
-            [
-                x.split("=")
-                for x in parsed_url.fragment.split("&")
-                if len(x.split("=")) == 2
-            ]
-        )
-        if "code" not in fragment_dict:
-            raise SmartmeterLoginError(
-                "Login failed. Could not extract 'code' from 'Location'"
-            )
-
-        code = fragment_dict["code"]
-        return code
-
-    def load_tokens(self, code):
-        """
-        Provided the totp code loads access and refresh token
-        """
-        try:
-            result = self.session.post(
-                const.AUTH_URL + "token",
-                data=const.build_access_token_args(code=code),
-            )
-        except Exception as exception:
-            raise SmartmeterConnectionError(
-                "Could not obtain access token"
-            ) from exception
-
-        if result.status_code != 200:
-            raise SmartmeterConnectionError(
-                f"Could not obtain access token: {result.content}"
-            )
-        tokens = result.json()
-        if tokens["token_type"] != "Bearer":
-            raise SmartmeterLoginError(
-                f'Bearer token required, but got {tokens["token_type"]!r}'
-            )
-        return tokens
-
-    def login(self):
-        """
-        login with credentials specified in ctor
-        """
-        url = self.load_login_page()
-        code = self.credentials_login(url)
-        tokens = self.load_tokens(code)
-
-        self._access_token = tokens["access_token"]
-        # TODO: use this to refresh the token of this session instead of re-login. may be nicer for the API
-        self._refresh_token = tokens["refresh_token"]
-        now = datetime.now()
-        self._access_token_expiration = now + timedelta(seconds=tokens["expires_in"])
-        self._refresh_token_expiration = now + timedelta(
-            seconds=tokens["refresh_expires_in"]
+        result = self.session.post(
+            self.AUTH_URL + "token",
+            data={
+                "code": code,
+                "grant_type": "authorization_code",
+                "client_id": "wn-smartmeter",
+                "redirect_uri": self.REFERER,
+                "code_verifier": self._code_verifier
+            },
         )
 
-        logger.debug("Access Token valid until %s" % self._access_token_expiration)
+        self._access_token = result.json()["access_token"]
 
-        self._api_gateway_token, self._api_gateway_b2b_token = self._get_api_key(
-            self._access_token
-        )
-        return self
+    def _dt_string(self, datetime_string):
+        return datetime_string.strftime(self.API_DATE_FORMAT)[:-3] + "Z"
 
-    def _access_valid_or_raise(self):
-        """Checks if the access token is still valid or raises an exception"""
-        if datetime.now() >= self._access_token_expiration:
-            # TODO: If the refresh token is still valid, it could be refreshed here
-            raise SmartmeterConnectionError(
-                "Access Token is not valid anymore, please re-log!"
-            )
-
-    def _get_api_key(self, token):
-        key_b2c = None
-        key_b2b = None
-
-        self._access_valid_or_raise()
-
-        headers = {"Authorization": f"Bearer {token}"}
-        try:
-            result = self.session.get(const.PAGE_URL, headers=headers)
-        except Exception as exception:
-            raise SmartmeterConnectionError("Could not obtain API key") from exception
-        tree = html.fromstring(result.content)
-        scripts = tree.xpath("(//script/@src)")
-
-        # sort the scripts in some order to find the keys faster
-        # so far, the script was called main.XXXX.js
-        scripts = sorted(scripts, key=lambda x: "main" not in x)
-        scripts.append('assets/app-config.json')
-
-        for script in scripts:
-            if key_b2c is not None and key_b2b is not None:
-                break
-            try:
-                response = self.session.get(const.PAGE_URL + script)
-            except Exception as exception:
-                raise SmartmeterConnectionError(
-                    "Could not obtain API Key from scripts"
-                ) from exception
-            key_b2c = const.API_GATEWAY_TOKEN_REGEX.search(response.text)
-            key_b2b = const.API_GATEWAY_B2B_TOKEN_REGEX.search(response.text)
-        if key_b2c is None or key_b2b is None:
-            raise SmartmeterConnectionError("Could not obtain API Key - no match")
-        return key_b2c.group(1), key_b2b.group(1)
-
-    @staticmethod
-    def _dt_string(datetime_string):
-        return datetime_string.strftime(const.API_DATE_FORMAT)[:-3] + "Z"
-
-    def _call_api(
+    def _call_api_wstw(
         self,
         endpoint,
         base_url=None,
@@ -206,123 +158,283 @@ class Smartmeter:
         data=None,
         query=None,
         return_response=False,
-        timeout=60.0,
-        extra_headers=None,
     ):
-        self._access_valid_or_raise()
-
         if base_url is None:
-            base_url = const.API_URL
-        url = f"{base_url}{endpoint}"
+            base_url = self.API_URL_WSTW
+        url = "{0}{1}".format(base_url, endpoint)
 
         if query:
             url += ("?" if "?" not in endpoint else "&") + parse.urlencode(query)
 
-        logger.debug("REQUEST: %s" % url)
+        logger.debug("REQUEST: {}", url)
 
         headers = {
             "Authorization": f"Bearer {self._access_token}",
+            "X-Gateway-APIKey": "afb0be74-6455-44f5-a34d-6994223020ba",
+            "Accept": "application/json",
         }
 
-        # For API calls to B2C or B2B, we need to add the Gateway-APIKey:
-        if base_url == const.API_URL:
-            headers["X-Gateway-APIKey"] = self._api_gateway_token
-        elif base_url == const.API_URL_B2B:
-            headers["X-Gateway-APIKey"] = self._api_gateway_b2b_token
-
-        if extra_headers:
-            headers.update(extra_headers)
-
         if data:
+            logger.debug("DATA: {}", data)
             headers["Content-Type"] = "application/json"
 
-        response = self.session.request(
-            method, url, headers=headers, json=data, timeout=timeout
-        )
+        response = self.session.request(method, url, headers=headers, json=data)
 
         if return_response:
             return response
 
         return response.json()
 
-    def _get_first_zaehlpunkt(self) -> (str, str):
-        zps = self.zaehlpunkte()[0]
-        customerId = zps["geschaeftspartner"]
-        zp = zps["zaehlpunkte"][0]["zaehlpunktnummer"]
-        return customerId, zp
+    def _call_api_wstw_b2b(
+        self,
+        endpoint,
+        base_url=None,
+        method="GET",
+        data=None,
+        query=None,
+        return_response=False,
+    ):
+        if base_url is None:
+            base_url = self.API_URL_WSTW_B2B
+        url = "{0}{1}".format(base_url, endpoint)
+
+        if query:
+            url += ("?" if "?" not in endpoint else "&") + parse.urlencode(query)
+
+        logger.debug("REQUEST: {}", url)
+
+        headers = {
+            "Authorization": f"Bearer {self._access_token}",
+            "X-Gateway-APIKey": "93d5d520-7cc8-11eb-99bc-ba811041b5f6",
+            "Accept": "application/json",
+        }
+
+        if data:
+            logger.debug("DATA: {}", data)
+            headers["Content-Type"] = "application/json"
+
+        response = self.session.request(method, url, headers=headers, json=data)
+
+        if return_response:
+            return response
+
+        return response.json()
+
+    def _call_api_wn(
+        self,
+        endpoint,
+        base_url=None,
+        method="GET",
+        data=None,
+        query=None,
+        return_response=False,
+    ):
+        if base_url is None:
+            base_url = self.API_URL_WN
+        url = "{0}{1}".format(base_url, endpoint)
+
+        if query:
+            url += ("?" if "?" not in endpoint else "&") + parse.urlencode(query)
+
+        logger.debug("REQUEST: {}", url)
+
+        headers = {
+            "Authorization": f"Bearer {self._access_token}",
+        }
+
+        if data:
+            logger.debug("DATA: {}", data)
+            headers["Content-Type"] = "application/json"
+
+        response = self.session.request(method, url, headers=headers, json=data)
+
+        if return_response:
+            return response
+
+        return response.json()
+
+    def _get_first_zaehlpunkt(self):
+        return self.zaehlpunkte()[0]["zaehlpunkte"][0]["zaehlpunktnummer"]
+
+    def _get_customerid(self):
+        """Returns 'geschaeftspartner' = CustomerID for currently logged in user."""
+        return self.profil()["defaultGeschaeftspartnerRegistration"]["geschaeftspartner"]
 
     def zaehlpunkte(self):
         """Returns zaehlpunkte for currently logged in user."""
-        return self._call_api("zaehlpunkte")
+        return self._call_api_wstw("zaehlpunkte")
+
+    def baseInformation(self):
+        """Returns response from 'baseInformation' endpoint."""
+        return self._call_api_wstw("zaehlpunkt/baseInformation")
 
     def consumptions(self):
         """Returns response from 'consumptions' endpoint."""
-        return self._call_api("zaehlpunkt/consumptions")
+        return self._call_api_wstw("zaehlpunkt/consumptions")
 
-    def base_information(self):
-        """Returns response from 'baseInformation' endpoint."""
-        return self._call_api("zaehlpunkt/baseInformation")
+    def pmaxReadings(self):
+        """Returns response from 'pmaxReadings' endpoint."""
+        return self._call_api_wstw("zaehlpunkt/pmaxReadings")
 
-    def meter_readings(self):
+    def meterReadings(self):
         """Returns response from 'meterReadings' endpoint."""
-        return self._call_api("zaehlpunkt/meterReadings")
+        return self._call_api_wstw("zaehlpunkt/meterReadings")
 
-    def verbrauch(
-        self,
-        customer_id: str,
-        zaehlpunkt: str,
-        date_from: datetime,
-        date_to: datetime = None,
-        resolution: const.Resolution = const.Resolution.HOUR
-    ):
-        """Returns energy usage.
-        This can be used to query the daily consumption for a long period of time,
-        for example several months or a week.
+    def verbrauch_raw(self, date_from, date_to=None, zaehlpunkt=None, rolle=None):
+        """
+        Legacy, do not use for new implementations
+
+        Returns energy usage.
+
         Args:
-            customer_id (str): Customer ID returned by zaehlpunkt call ("geschaeftspartner")
-            zaehlpunkt (str, optional): id for desired smartmeter.
-                If None, check for first meter in user profile.
             date_from (datetime): Start date for energy usage request
             date_to (datetime, optional): End date for energy usage request.
-                Defaults to datetime.now()
-            resolution (const.Resolution, optional): Specify either 1h or 15min resolution
+                Defaults to datetime.now().
+            zaehlpunkt (str, optional): Id for desired smartmeter.
+                If None check for first meter in user profile.
+
+        Returns:
+            dict: JSON response of api call
+        """
+        if rolle is None:
+            rolle = "V001"
+        if date_to is None:
+            date_to = datetime.now()
+        if zaehlpunkt is None:
+            zaehlpunkt = self._get_first_zaehlpunkt()
+        customerid = self._get_customerid()
+        endpoint = "/user/messwerte/bewegungsdaten"
+        query = {
+            "geschaeftspartner": customerid,
+            "zaehlpunktnummer": zaehlpunkt,
+            "rolle": rolle,
+            "zeitpunktVon": self._dt_string(date_from),
+            "zeitpunktBis": self._dt_string(date_to),
+            "aggregat": "SUM_PER_DAY",
+        }
+        return self._call_api_wn(endpoint, query=query)
+
+    def verbrauch(self, date_from, date_to=None, zaehlpunkt=None, rolle=None):
+        """
+        Legacy, do not use for new implementations
+
+        Returns energy usage.
+
+        Args:
+            date_from (datetime.datetime): Starting date for energy usage request
+            date_to (datetime.datetime, optional): Ending date for energy usage request.
+                Defaults to datetime.datetime.now().
+            zaehlpunkt (str, optional): Id for desired smartmeter.
+                If None check for first meter in user profile.
+
         Returns:
             dict: JSON response of api call to
-                'messdaten/CUSTOMER_ID/ZAEHLPUNKT/verbrauchRaw'
+        """
+        if rolle is None:
+            rolle = "V002"
+        if date_to is None:
+            date_to = datetime.now()
+        if zaehlpunkt is None:
+            zaehlpunkt = self._get_first_zaehlpunkt()
+        customerid = self._get_customerid()
+        endpoint = "/user/messwerte/bewegungsdaten"
+        query = {
+            "geschaeftspartner": customerid,
+            "zaehlpunktnummer": zaehlpunkt,
+            "rolle": rolle,
+            "zeitpunktVon": self._dt_string(date_from),
+            "zeitpunktBis": self._dt_string(date_to),
+            "aggregat": "NONE",
+        }
+        return self._call_api_wn(endpoint, query=query)
+
+    def bewegungsdaten(self, date_from, date_to=None, zaehlpunkt=None, rolle=None, aggregat=None):
+        """
+        Returns energy usage.
+
+        Args:
+            date_from (datetime.datetime): Starting date for energy usage request
+            date_to (datetime.datetime, optional): Ending date for energy usage request.
+                Defaults to datetime.datetime.now().
+            zaehlpunkt (str, optional): Id for desired smartmeter.
+                If None check for first meter in user profile.
+            rolle (str, optional):
+                'V001' for quarter hour (default)
+                'V002' for daily averages
+            aggregat (str, optional):
+                'NONE' or 'SUM_PER_DAY' are valid values
+
+        Returns:
+            dict: JSON response of api call to
+            '/user/messwerte/bewegungsdaten'
+        """
+        if rolle is None:
+            rolle = "V001"
+        if date_to is None:
+            date_to = datetime.now()
+        if zaehlpunkt is None:
+            zaehlpunkt = self._get_first_zaehlpunkt()
+        customerid = self._get_customerid()
+        endpoint = "/user/messwerte/bewegungsdaten"
+        query = {
+            "geschaeftspartner": customerid,
+            "zaehlpunktnummer": zaehlpunkt,
+            "rolle": rolle,
+            "zeitpunktVon": self._dt_string(date_from),
+            "zeitpunktBis": self._dt_string(date_to),
+        }
+        if aggregat is not None:
+            query["aggregat"]=aggregat
+        return self._call_api_wn(endpoint, query=query)
+
+    def messwerte(self, date_from, date_to=None, zaehlpunkt=None,wertetyp="METER_READ"):
+        """Returns energy usage / Response from messwerte endpoint.
+
+        Args:
+            date_from (datetime.datetime): Starting date for energy usage request
+            date_to (datetime.datetime, optional): Ending date for energy usage request.
+                Defaults to datetime.datetime.now().
+            zaehlpunkt (str, optional): Id for desired smartmeter.
+                If None check for first meter in user profile.
+            wertetyp (str, optional): "DAY", "QUARTER_HOUR" or "METER_READ".
+                Defaults to "METER_READ"
+
+        Returns:
+            dict: JSON response of api call to
+                'zaehlpunkte/CUSTOMERID/ZAEHLPUNKT/messwerte'
         """
         if date_to is None:
             date_to = datetime.now()
-        if zaehlpunkt is None or customer_id is None:
-            customerId, zaehlpunkt = self._get_first_zaehlpunkt()
-        endpoint = f"messdaten/{customer_id}/{zaehlpunkt}/verbrauch"
-        query = const.build_verbrauchs_args(
-            dateFrom=self._dt_string(date_from),
-            dateTo=self._dt_string(date_to),
-            granularity="DAY",
-            dayViewResolution=resolution.value
-        )
-        return self._call_api(endpoint, query=query)
+        if zaehlpunkt is None:
+            zaehlpunkt = self._get_first_zaehlpunkt()
+        endpoint = "zaehlpunkte/{0}/{1}/messwerte".format(self._get_customerid(),zaehlpunkt)
+        query = {
+            "datumVon": date_from.strftime("%Y-%m-%d"),
+            "datumBis": date_to.strftime("%Y-%m-%d"),
+            "wertetyp": wertetyp,
+        }
+        return self._call_api_wstw_b2b(endpoint, query=query)
 
     def profil(self):
-        """Returns profile of a logged-in user.
+        """Returns profil of logged in user.
 
         Returns:
-            dict: JSON response of api call to 'user/profile'
+            dict: JSON response of api call to 'w/user/profile'
         """
-        return self._call_api("user/profile", const.API_URL_ALT)
+        return self._call_api_wn("user/profile")
 
-    def ereignisse(
-        self, date_from: datetime, date_to: datetime = None, zaehlpunkt=None
-    ):
+    def ereignisse(self, date_from, date_to=None, zaehlpunkt=None):
         """Returns events between date_from and date_to of a specific smart meter.
+
         Args:
             date_from (datetime.datetime): Starting date for request
             date_to (datetime.datetime, optional): Ending date for request.
                 Defaults to datetime.datetime.now().
-            zaehlpunkt (str, optional): id for desired smart meter.
+            zaehlpunkt (str, optional): Id for desired smart meter.
                 If is None check for first meter in user profile.
+
         Returns:
-            dict: JSON response of api call to 'user/ereignisse'
+            dict: JSON response of api call to 'w/user/ereignisse'
         """
         if date_to is None:
             date_to = datetime.now()
@@ -333,18 +445,19 @@ class Smartmeter:
             "dateFrom": self._dt_string(date_from),
             "dateUntil": self._dt_string(date_to),
         }
-        return self._call_api("user/ereignisse", const.API_URL_ALT, query=query)
+        return self._call_api_wn("user/ereignisse", query=query)
 
     def create_ereignis(self, zaehlpunkt, name, date_from, date_to=None):
         """Creates new event.
+
         Args:
             zaehlpunkt (str): Id for desired smartmeter.
-                If None, check for first meter in user profile
             name (str): Event name
             date_from (datetime.datetime): (Starting) date for request
             date_to (datetime.datetime, optional): Ending date for request.
+
         Returns:
-            dict: JSON response of api call to 'user/ereignis'
+            dict: JSON response of api call to 'w/user/ereignis'
         """
         if date_to is None:
             dto = None
@@ -361,62 +474,8 @@ class Smartmeter:
             "zaehlpunkt": zaehlpunkt,
         }
 
-        return self._call_api("user/ereignis", data=data, method="POST")
+        return self._call_api_wn("user/ereignis", data=data, method="POST")
 
     def delete_ereignis(self, ereignis_id):
         """Deletes ereignis."""
-        return self._call_api(f"user/ereignis/{ereignis_id}", method="DELETE")
-
-    def historical_data(
-        self,
-        zaehlpunkt: str = None,
-        date_from: date = None,
-        date_until: date = None,
-        valuetype: const.ValueType = const.ValueType.QUARTER_HOUR,
-    ):
-        """
-        Query historical data in a batch
-        If no arguments are given, a span of three year is queried (same day as today but from current year - 3).
-        If date_from is not given but date_until, again a three year span is assumed.
-        """
-        if zaehlpunkt is None:
-            customer_id, zaehlpunkt = self._get_first_zaehlpunkt()
-
-        if date_until is None:
-            date_until = date.today()
-
-        if date_from is None:
-            date_from = date_until.replace(year=date_until.year - 3)
-
-        query = {
-            "datumVon": date_from.strftime("%Y-%m-%d"),
-            "datumBis": date_until.strftime("%Y-%m-%d"),
-            "wertetyp": valuetype.value,
-        }
-
-        extra = {
-            # For this API Call, requesting json is important!
-            "Accept": "application/json"
-        }
-
-        url = f"zaehlpunkte/{customer_id}/{zaehlpunkt}/messwerte"
-        data = self._call_api(
-            url,
-            base_url=const.API_URL_B2B,
-            query=query,
-            extra_headers=extra,
-        )
-
-        # Some Sanity Checks...
-        if len(data['zaehlwerke']) != 1 or data['zaehlpunkt'] != zaehlpunkt:
-            # TODO: Is it possible to have multiple zaehlwerke in one zaehlpunkt?
-            # I guess so, otherwise it would not be a list...
-            # Probably (my guess), we would see this on the OBIS Code.
-            # The OBIS Code can code for channels, thus we would probably see that there.
-            # Keep that in mind if for someone this fails.
-            logger.debug("Returned data: %s" % data)
-            raise SmartmeterQueryError("Returned data does not match given zaehlpunkt!")
-        obis_code = data["zaehlwerke"][0]["obisCode"]
-        if obis_code[0] != '1':
-            logger.warning(f"The OBIS code of the meter ({obis_code}) reports that this meter does not count electrical energy!")
-        return data["zaehlwerke"][0]
+        return self._call_api_wn("user/ereignis/{}".format(ereignis_id), method="DELETE", return_response=True)

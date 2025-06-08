@@ -5,7 +5,7 @@ def filter_df(df, start_date, end_date, resample):
     _df = df.loc[(df.index >= pd.Timestamp(str(start_date))) & (df.index < pd.Timestamp(str(end_date)))]
     return _df.resample(resample).sum()
 
-def get_usage_estimation(pv_df, sm_df, estimation_threshold=0.000, basic_energy_usage=0.01):
+def get_usage_estimation(pv_df, sm_df, estimation_threshold=0.000, basic_energy_usage=0.013):
     start_date = '2023-09-04'
     end_date = '2199-01-01'
     resample = '15min'
